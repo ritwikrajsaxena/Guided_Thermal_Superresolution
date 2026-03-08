@@ -1,0 +1,1451 @@
+
+
+# ==================== IMPORTS ====================
+import os, sys, glob, math, random, functools, zipfile, json
+import numpy as np
+from PIL import Image
+from collections import OrderedDict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.models as models
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from skimage.metrics import peak_signal_noise_ratio as calc_psnr
+from skimage.metrics import structural_similarity as calc_ssim
+
+_orig_torch_load = torch.load
+torch.load = functools.partial(_orig_torch_load, weights_only=False)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+# ==================== OUTPUT DIRECTORY ====================
+OUT_DIR = None
+
+def set_out_dir(data_root):
+    global OUT_DIR
+    OUT_DIR = os.path.join(data_root, "vae_sr_results")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    print(f"  Output directory: {OUT_DIR}")
+    return OUT_DIR
+
+def get_out_dir():
+    if OUT_DIR is None:
+        raise RuntimeError("Call set_out_dir() first")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    return OUT_DIR
+
+
+###############################################################################
+#                    1.  LOSS FUNCTIONS (from working code)                    #
+###############################################################################
+
+class CharbonnierLoss(nn.Module):
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps2 = eps ** 2
+
+    def forward(self, pred, target):
+        return torch.mean(torch.sqrt((pred - target) ** 2 + self.eps2))
+
+
+class SSIMLoss(nn.Module):
+    """Identical to working code's proven SSIM implementation."""
+    def __init__(self, window_size=11):
+        super().__init__()
+        self.w = window_size
+        self.register_buffer("_gauss", self._make_kernel(window_size))
+
+    @staticmethod
+    def _make_kernel(ws, sigma=1.5):
+        ax = torch.arange(ws, dtype=torch.float32) - ws // 2
+        g = torch.exp(-ax ** 2 / (2 * sigma ** 2))
+        g = g / g.sum()
+        k = g.unsqueeze(1) @ g.unsqueeze(0)
+        return k.unsqueeze(0).unsqueeze(0)
+
+    def forward(self, pred, target):
+        C = pred.size(1)
+        kernel = self._gauss.expand(C, 1, -1, -1).to(pred.device)
+        pad = self.w // 2
+        mu_p = F.conv2d(pred,   kernel, padding=pad, groups=C)
+        mu_t = F.conv2d(target, kernel, padding=pad, groups=C)
+        s_pp = F.conv2d(pred * pred,     kernel, padding=pad, groups=C) - mu_p * mu_p
+        s_tt = F.conv2d(target * target, kernel, padding=pad, groups=C) - mu_t * mu_t
+        s_pt = F.conv2d(pred * target,   kernel, padding=pad, groups=C) - mu_p * mu_t
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        ssim_map = ((2 * mu_p * mu_t + C1) * (2 * s_pt + C2)) / \
+                   ((mu_p ** 2 + mu_t ** 2 + C1) * (s_pp + s_tt + C2))
+        return 1.0 - ssim_map.mean()
+
+
+class PerceptualLoss(nn.Module):
+    """Identical to working code."""
+    def __init__(self):
+        super().__init__()
+        try:
+            vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
+        except Exception:
+            vgg = models.vgg19(pretrained=True).features
+        self.s1 = nn.Sequential(*list(vgg)[:4]).eval()
+        self.s2 = nn.Sequential(*list(vgg)[4:9]).eval()
+        self.s3 = nn.Sequential(*list(vgg)[9:18]).eval()
+        for p in self.parameters():
+            p.requires_grad = False
+        self.register_buffer("mean", torch.tensor([.485,.456,.406]).view(1,3,1,1))
+        self.register_buffer("std",  torch.tensor([.229,.224,.225]).view(1,3,1,1))
+
+    def train(self, mode=True):
+        return super().train(False)
+
+    def _norm(self, x):
+        if x.size(1) == 1:
+            x = x.expand(-1, 3, -1, -1)
+        return (x - self.mean) / self.std
+
+    def forward(self, pred, target):
+        p, t = self._norm(pred), self._norm(target)
+        f1p, f1t = self.s1(p), self.s1(t)
+        f2p, f2t = self.s2(f1p), self.s2(f1t)
+        f3p, f3t = self.s3(f2p), self.s3(f2t)
+        return F.l1_loss(f1p, f1t) + F.l1_loss(f2p, f2t) + F.l1_loss(f3p, f3t)
+
+
+class EdgeLoss(nn.Module):
+    """Identical to working code."""
+    def __init__(self):
+        super().__init__()
+        sx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32)
+        sy = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32)
+        self.register_buffer("sx", sx.view(1,1,3,3))
+        self.register_buffer("sy", sy.view(1,1,3,3))
+
+    def forward(self, pred, target):
+        px = F.conv2d(pred,   self.sx, padding=1)
+        py = F.conv2d(pred,   self.sy, padding=1)
+        tx = F.conv2d(target, self.sx, padding=1)
+        ty = F.conv2d(target, self.sy, padding=1)
+        return F.l1_loss(px, tx) + F.l1_loss(py, ty)
+
+
+class CombinedSRLoss(nn.Module):
+    """
+    Working code's CombinedLoss + carefully weighted KL & VAE reconstruction.
+    Only 4 core terms + 2 small VAE terms = 6 total (vs broken code's 8+).
+    """
+    def __init__(self, w_char=1.0, w_ssim=0.5, w_perc=0.02, w_edge=0.1,
+                 w_kl=0.0001, w_vae_recon=0.01):
+        super().__init__()
+        self.w = dict(char=w_char, ssim=w_ssim, perc=w_perc, edge=w_edge,
+                      kl=w_kl, vae_recon=w_vae_recon)
+        self.char = CharbonnierLoss()
+        self.ssim = SSIMLoss()
+        self.perc = PerceptualLoss()
+        self.edge = EdgeLoss()
+
+    def forward(self, pred, target, kl_loss=None, vae_recon_loss=None,
+                epoch=0, max_epochs=500, kl_warmup=50):
+        # ── Core SR losses (IDENTICAL to working code) ──
+        L  = self.w["char"] * self.char(pred, target)
+        L += self.w["ssim"] * self.ssim(pred, target)
+        L += self.w["perc"] * self.perc(pred, target)
+        L += self.w["edge"] * self.edge(pred, target)
+
+        # ── VAE losses (NEW, carefully weighted) ──
+        if kl_loss is not None:
+            kl_anneal = min(1.0, epoch / max(kl_warmup, 1))
+            L += self.w["kl"] * kl_anneal * kl_loss
+
+        if vae_recon_loss is not None:
+            L += self.w["vae_recon"] * vae_recon_loss
+
+        return L
+
+
+###############################################################################
+#                   2.  MODEL BUILDING BLOCKS (from working code)             #
+###############################################################################
+
+class ChannelAttention(nn.Module):
+    def __init__(self, ch, r=16):
+        super().__init__()
+        mid = max(ch // r, 8)
+        self.fc = nn.Sequential(
+            nn.Conv2d(ch, mid, 1, bias=False), nn.ReLU(True),
+            nn.Conv2d(mid, ch, 1, bias=False))
+
+    def forward(self, x):
+        a = self.fc(F.adaptive_avg_pool2d(x, 1))
+        m = self.fc(F.adaptive_max_pool2d(x, 1))
+        return x * torch.sigmoid(a + m)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, ks=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, ks, padding=ks // 2, bias=False)
+
+    def forward(self, x):
+        desc = torch.cat([x.mean(1, keepdim=True), x.amax(1, keepdim=True)], 1)
+        return x * torch.sigmoid(self.conv(desc))
+
+
+class RCAB(nn.Module):
+    def __init__(self, nf, r=16):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(nf, nf, 3, 1, 1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf, nf, 3, 1, 1))
+        self.ca = ChannelAttention(nf, r)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        return x + self.sa(self.ca(self.body(x)))
+
+
+class ResidualDenseBlock(nn.Module):
+    def __init__(self, nf=64, gc=32):
+        super().__init__()
+        self.c1 = nn.Conv2d(nf,         gc, 3, 1, 1)
+        self.c2 = nn.Conv2d(nf + gc,    gc, 3, 1, 1)
+        self.c3 = nn.Conv2d(nf + 2*gc,  gc, 3, 1, 1)
+        self.c4 = nn.Conv2d(nf + 3*gc,  gc, 3, 1, 1)
+        self.c5 = nn.Conv2d(nf + 4*gc,  nf, 3, 1, 1)
+        self.act = nn.LeakyReLU(0.2, True)
+
+    def forward(self, x):
+        x1 = self.act(self.c1(x))
+        x2 = self.act(self.c2(torch.cat([x, x1], 1)))
+        x3 = self.act(self.c3(torch.cat([x, x1, x2], 1)))
+        x4 = self.act(self.c4(torch.cat([x, x1, x2, x3], 1)))
+        x5 = self.c5(torch.cat([x, x1, x2, x3, x4], 1))
+        return x5 * 0.2 + x
+
+
+class RRDB(nn.Module):
+    def __init__(self, nf=64, gc=32):
+        super().__init__()
+        self.b1 = ResidualDenseBlock(nf, gc)
+        self.b2 = ResidualDenseBlock(nf, gc)
+        self.b3 = ResidualDenseBlock(nf, gc)
+
+    def forward(self, x):
+        return self.b3(self.b2(self.b1(x))) * 0.2 + x
+
+
+###############################################################################
+#              3.  CROSS-MODAL VAE (★ NEW — carefully designed)               #
+###############################################################################
+
+class ConvVAEEncoder(nn.Module):
+    """
+    Lightweight convolutional encoder for feature-space VAE.
+    Operates on nf-channel feature maps at LR resolution.
+    """
+    def __init__(self, in_ch, latent_dim=32):
+        super().__init__()
+        mid = in_ch
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_ch, mid, 3, 1, 1),
+            nn.GroupNorm(8, mid),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(mid, mid, 3, 1, 1),
+            nn.GroupNorm(8, mid),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.mu     = nn.Conv2d(mid, latent_dim, 1)
+        self.logvar = nn.Conv2d(mid, latent_dim, 1)
+
+        # Initialize logvar small → small initial variance → stable
+        nn.init.constant_(self.logvar.weight, 0)
+        nn.init.constant_(self.logvar.bias, -2.0)   # exp(-2) ≈ 0.135
+
+    def forward(self, x):
+        h = self.encoder(x)
+        return self.mu(h), self.logvar(h)
+
+
+class ConvVAEDecoder(nn.Module):
+    """Lightweight convolutional decoder for feature-space VAE."""
+    def __init__(self, latent_dim, out_ch):
+        super().__init__()
+        mid = out_ch
+        self.decoder = nn.Sequential(
+            nn.Conv2d(latent_dim, mid, 3, 1, 1),
+            nn.GroupNorm(8, mid),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(mid, mid, 3, 1, 1),
+            nn.GroupNorm(8, mid),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(mid, out_ch, 3, 1, 1),
+        )
+
+    def forward(self, z):
+        return self.decoder(z)
+
+
+class CrossModalVAE(nn.Module):
+    """
+    Cross-Modal VAE for thermal ↔ visible feature alignment.
+
+    Why this works (vs broken code's VAE):
+    ────────────────────────────────────────
+    1. Operates in FEATURE space (not pixel space) → compact, stable
+    2. Pretrained SEPARATELY before SR training → no training instability
+    3. Lightweight (only ~2M extra params) → doesn't overwhelm SR model
+    4. Gated fusion → model can learn to IGNORE VAE if unhelpful
+    5. logvar clamped + initialized small → prevents variance explosion
+    6. Separate encoders for each modality → proper alignment learning
+    """
+    def __init__(self, nf=64, latent_dim=32):
+        super().__init__()
+        self.latent_dim = latent_dim
+
+        # Separate encoders
+        self.enc_th  = ConvVAEEncoder(nf, latent_dim)
+        self.enc_vis = ConvVAEEncoder(nf, latent_dim)
+
+        # Shared decoder → reconstructs to nf channels
+        self.decoder = ConvVAEDecoder(latent_dim, nf)
+
+        # Learnable gated fusion in latent space
+        self.fusion_gate = nn.Sequential(
+            nn.Conv2d(latent_dim * 2, latent_dim, 1),
+            nn.Sigmoid()
+        )
+
+        # Latent → feature projection (for conditioning the SR trunk)
+        self.latent_proj = nn.Sequential(
+            nn.Conv2d(latent_dim, nf, 1),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf, nf, 3, 1, 1),
+        )
+
+    @staticmethod
+    def reparameterize(mu, logvar, training=True):
+        if training:
+            std = torch.exp(0.5 * logvar.clamp(-10, 2))
+            return mu + torch.randn_like(std) * std
+        return mu                                       # deterministic at test time
+
+    @staticmethod
+    def kl_divergence(mu, logvar):
+        logvar = logvar.clamp(-10, 2)
+        return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+    def forward(self, th_feat, vis_feat, training=True):
+        """
+        Args
+        ────
+        th_feat:  (B, nf, H, W)  thermal features from head
+        vis_feat: (B, nf, H, W)  visible features (guide) at same resolution
+
+        Returns
+        ───────
+        latent_feat:    (B, nf, H, W)  aligned features for trunk conditioning
+        kl_loss:        scalar          KL divergence (training only)
+        recon_loss:     scalar          feature reconstruction (training only)
+        """
+        mu_th,  logvar_th  = self.enc_th(th_feat)
+        mu_vis, logvar_vis = self.enc_vis(vis_feat)
+
+        z_th  = self.reparameterize(mu_th,  logvar_th,  training)
+        z_vis = self.reparameterize(mu_vis, logvar_vis, training)
+
+        # Gated fusion: learn how much to trust each modality
+        gate   = self.fusion_gate(torch.cat([z_th, z_vis], 1))
+        z_fused = gate * z_th + (1 - gate) * z_vis
+
+        # Decode & project
+        decoded     = self.decoder(z_fused)
+        latent_feat = self.latent_proj(z_fused)
+
+        if training:
+            kl_loss     = self.kl_divergence(mu_th, logvar_th) + \
+                          self.kl_divergence(mu_vis, logvar_vis)
+            recon_loss  = F.l1_loss(decoded, th_feat)
+            align_loss  = F.mse_loss(mu_th, mu_vis)
+            return latent_feat, kl_loss, recon_loss + 0.1 * align_loss
+        return latent_feat
+
+
+###############################################################################
+#       4.  VAE-ENHANCED GUIDED RRDB BLOCKS (modified from working code)      #
+###############################################################################
+
+class VAEGuidedRRDB(nn.Module):
+    """
+    Working code's GuidedRRDB + VAE latent conditioning.
+
+    Guide features  → gated injection   (from working code, unchanged)
+    VAE features    → additive residual  (NEW, gated so it can be ignored)
+    """
+    def __init__(self, nf=64, gc=32):
+        super().__init__()
+        self.rrdb = RRDB(nf, gc)
+
+        # Guide injection (IDENTICAL to working code)
+        self.guide_proj = nn.Sequential(
+            nn.Conv2d(nf, nf, 1), nn.LeakyReLU(0.2, True))
+        self.guide_gate = nn.Sequential(
+            nn.Conv2d(nf * 2, nf, 1), nn.Sigmoid())
+
+        # ★ VAE injection (NEW — additive with learned gate)
+        self.vae_proj = nn.Sequential(
+            nn.Conv2d(nf, nf, 1), nn.LeakyReLU(0.2, True))
+        self.vae_gate = nn.Sequential(
+            nn.Conv2d(nf * 2, nf, 1), nn.Sigmoid())
+
+    def forward(self, x, guide_feat, vae_feat=None):
+        out = self.rrdb(x)
+
+        # Guide gating (from working code)
+        g    = self.guide_proj(guide_feat)
+        gate = self.guide_gate(torch.cat([out, g], 1))
+        out  = out * gate + x * (1 - gate)
+
+        # VAE conditioning (NEW — additive residual, can be zero)
+        if vae_feat is not None:
+            v      = self.vae_proj(vae_feat)
+            v_gate = self.vae_gate(torch.cat([out, v], 1))
+            out    = out + v * v_gate * 0.1   # small scale factor for stability
+
+        return out
+
+
+class VAEGuidedTrunk(nn.Module):
+    """RRDB trunk with guide + VAE injection at every block."""
+    def __init__(self, n_rrdb, nf=64, gc=32):
+        super().__init__()
+        self.blocks = nn.ModuleList([VAEGuidedRRDB(nf, gc) for _ in range(n_rrdb)])
+        self.conv   = nn.Conv2d(nf, nf, 3, 1, 1)
+
+    def forward(self, x, guide_feat, vae_feat=None):
+        h = x
+        for blk in self.blocks:
+            h = blk(h, guide_feat, vae_feat)
+        return self.conv(h) + x   # long skip
+
+
+###############################################################################
+#               5.  SFT FUSION (from working code, unchanged)                 #
+###############################################################################
+
+class EnhancedSFTFusion(nn.Module):
+    def __init__(self, nf):
+        super().__init__()
+        self.cond = nn.Sequential(
+            nn.Conv2d(nf, nf, 3, 1, 1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf, nf, 3, 1, 1), nn.LeakyReLU(0.2, True))
+        self.scale_net = nn.Sequential(
+            nn.Conv2d(nf*2, nf, 3, 1, 1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf, nf, 3, 1, 1), nn.Sigmoid())
+        self.shift_net = nn.Sequential(
+            nn.Conv2d(nf*2, nf, 3, 1, 1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf, nf, 3, 1, 1))
+        self.ca     = ChannelAttention(nf * 2)
+        self.reduce = nn.Conv2d(nf * 2, nf, 1)
+
+    def forward(self, thermal, guide):
+        g   = self.cond(guide)
+        cat = torch.cat([thermal, g], 1)
+        sft = thermal * self.scale_net(cat) + self.shift_net(cat)
+        return self.reduce(self.ca(torch.cat([sft, g], 1)))
+
+
+###############################################################################
+#              6.  GUIDE ENCODER (from working code, unchanged)               #
+###############################################################################
+
+class GuideEncoder(nn.Module):
+    def __init__(self, nf=64):
+        super().__init__()
+        self.shallow = nn.Sequential(
+            nn.Conv2d(3, nf, 3, 1, 1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf, nf, 3, 1, 1), nn.LeakyReLU(0.2, True))
+        try:
+            resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
+        except Exception:
+            resnet = models.resnet34(pretrained=True)
+        self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu)
+        self.pool   = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        for p in list(self.layer0.parameters()) + list(self.layer1.parameters()):
+            p.requires_grad = False
+        self.p2  = nn.Conv2d(64,  nf, 1)
+        self.p4  = nn.Conv2d(64,  nf, 1)
+        self.p8  = nn.Conv2d(128, nf, 1)
+        self.p16 = nn.Conv2d(256, nf, 1)
+
+    def forward(self, vis):
+        f0 = self.layer0(vis)
+        f1 = self.layer1(self.pool(f0))
+        f2 = self.layer2(f1)
+        f3 = self.layer3(f2)
+        return {"s1": self.shallow(vis), "s2": self.p2(f0),
+                "s4": self.p4(f1), "s8": self.p8(f2), "s16": self.p16(f3)}
+
+
+###############################################################################
+#          7.  MAIN SR NETWORK WITH PRETRAINED VAE (★ key module)             #
+###############################################################################
+
+class VAEGuidedThermalSRNet(nn.Module):
+    """
+    LR thermal (1ch) + HR visible (3ch) → HR thermal (1ch)
+
+    Architecture (based on working code + VAE):
+    ──────────────────────────────────────────────
+    1.  Thermal head             → shallow features
+    2.  GuideEncoder (ResNet-34) → multi-scale visible features
+    3.  ★ CrossModalVAE          → aligned latent features (NEW)
+    4.  VAEGuidedTrunk           → deep features (guide + VAE injected at every block)
+    5.  SFT pre-fusion           → prepare for upsampling
+    6.  Progressive ×2 upsample  → with SFT fusion at each stage
+    7.  RCAB refinement          → final quality polish
+    8.  Output + bicubic skip    → global residual learning
+    """
+    def __init__(self, scale, nf=64, n_rrdb=12, gc=32,
+                 n_rcab_stage=3, n_rcab_final=4, latent_dim=32):
+        super().__init__()
+        self.scale = scale
+
+        # ── Thermal head (from working code) ──
+        self.head = nn.Sequential(
+            nn.Conv2d(1, nf, 3, 1, 1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf, nf, 3, 1, 1))
+
+        # ── Guide encoder (from working code) ──
+        self.guide_enc = GuideEncoder(nf)
+
+        # ── ★ Cross-Modal VAE (NEW) ──
+        self.vae = CrossModalVAE(nf, latent_dim)
+
+        # ── VAE-Enhanced Guided Trunk (modified working code) ──
+        self.guided_trunk = VAEGuidedTrunk(n_rrdb, nf, gc)
+
+        # ── Pre-upsample fusion (from working code) ──
+        self.pre_fuse = EnhancedSFTFusion(nf)
+
+        # ── Progressive upsample (from working code) ──
+        n_stages = int(math.log2(scale))
+        self.n_stages = n_stages
+
+        self.up_convs = nn.ModuleList()
+        self.fusions  = nn.ModuleList()
+        self.refiners = nn.ModuleList()
+
+        self._guide_keys = []
+        rem = scale
+        for _ in range(n_stages):
+            rem //= 2
+            if   rem >= 16: self._guide_keys.append("s16")
+            elif rem >= 8:  self._guide_keys.append("s8")
+            elif rem >= 4:  self._guide_keys.append("s4")
+            elif rem >= 2:  self._guide_keys.append("s2")
+            else:           self._guide_keys.append("s1")
+
+        for _ in range(n_stages):
+            self.up_convs.append(nn.Sequential(
+                nn.Conv2d(nf, nf * 4, 3, 1, 1),
+                nn.PixelShuffle(2),
+                nn.LeakyReLU(0.2, True)))
+            self.fusions.append(EnhancedSFTFusion(nf))
+            self.refiners.append(nn.Sequential(
+                *[RCAB(nf) for _ in range(n_rcab_stage)]))
+
+        # ── Final refinement (from working code) ──
+        self.final_ref = nn.Sequential(*[RCAB(nf) for _ in range(n_rcab_final)])
+        self.out_conv  = nn.Sequential(
+            nn.Conv2d(nf, nf, 3, 1, 1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf, 1, 3, 1, 1))
+
+    @property
+    def _pre_key(self):
+        s = self.scale
+        if   s >= 16: return "s16"
+        elif s >= 8:  return "s8"
+        elif s >= 4:  return "s4"
+        else:         return "s2"
+
+    def forward(self, lr_therm, hr_vis, training=True):
+        # Bicubic baseline for global residual
+        bic = F.interpolate(lr_therm, scale_factor=self.scale,
+                            mode="bicubic", align_corners=False)
+
+        # Thermal features
+        shallow = self.head(lr_therm)
+
+        # Guide features (multi-scale)
+        gf = self.guide_enc(hr_vis)
+
+        # Guide at LR resolution for trunk injection
+        g_lr = F.interpolate(gf[self._pre_key], size=shallow.shape[2:],
+                             mode="bilinear", align_corners=False)
+
+        # ★ VAE cross-modal alignment
+        kl_loss = vae_recon_loss = None
+        if training:
+            vae_feat, kl_loss, vae_recon_loss = self.vae(shallow, g_lr, training=True)
+        else:
+            vae_feat = self.vae(shallow, g_lr, training=False)
+
+        # VAE-Enhanced deep trunk
+        deep = self.guided_trunk(shallow, g_lr, vae_feat)
+
+        # Pre-upsample fusion
+        x = self.pre_fuse(deep, g_lr)
+
+        # Progressive upsample
+        for i in range(self.n_stages):
+            x = self.up_convs[i](x)
+            g = F.interpolate(gf[self._guide_keys[i]], size=x.shape[2:],
+                              mode="bilinear", align_corners=False)
+            x = self.fusions[i](x, g)
+            x = self.refiners[i](x)
+
+        x   = self.final_ref(x)
+        out = self.out_conv(x)
+
+        if out.shape[2:] != bic.shape[2:]:
+            out = F.interpolate(out, size=bic.shape[2:],
+                                mode="bilinear", align_corners=False)
+
+        if training:
+            return out + bic, kl_loss, vae_recon_loss
+        return out + bic
+
+
+###############################################################################
+#                        8.  EMA (from working code)                          #
+###############################################################################
+
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {n: p.data.clone()
+                       for n, p in model.named_parameters() if p.requires_grad}
+
+    def update(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.shadow[n].mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
+
+    def apply(self, model):
+        self.backup = {}
+        for n, p in model.named_parameters():
+            if n in self.shadow:
+                self.backup[n] = p.data.clone()
+                p.data.copy_(self.shadow[n])
+
+    def restore(self, model):
+        for n, p in model.named_parameters():
+            if n in self.backup:
+                p.data.copy_(self.backup[n])
+        self.backup = {}
+
+
+###############################################################################
+#                    9.  DATASETS (from working code, unchanged)              #
+###############################################################################
+
+def _thermal_base_to_vis_base(thermal_base):
+    parts = thermal_base.rsplit("_th", 1)
+    return "_vis".join(parts)
+
+def _find_file(directory, base):
+    for ext in (".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+        p = os.path.join(directory, base + ext)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+class ThermalGuidedDataset(Dataset):
+    """Train / Val dataset — IDENTICAL to working code."""
+    def __init__(self, root, scale, split="train", patch_size=256, augment=True):
+        self.scale = scale
+        self.ps    = patch_size
+        self.aug   = augment and split == "train"
+        self.split = split
+
+        lr_dir  = os.path.join(root, "thermal", split, f"LR_x{scale}")
+        hr_dir  = os.path.join(root, "thermal", split, "GT")
+        vis_dir = os.path.join(root, "visible", split)
+
+        self.triplets = []
+        for lr_path in sorted(glob.glob(os.path.join(lr_dir, "*.*"))):
+            th_base  = os.path.splitext(os.path.basename(lr_path))[0]
+            hr_path  = _find_file(hr_dir, th_base)
+            vis_base = _thermal_base_to_vis_base(th_base)
+            vis_path = _find_file(vis_dir, vis_base)
+            if hr_path and vis_path:
+                self.triplets.append((lr_path, hr_path, vis_path, th_base))
+
+        print(f"  [{split:5s}] Loaded {len(self.triplets)} triplets  (scale ×{scale})")
+
+    @staticmethod
+    def _load_gray(path):
+        return np.array(Image.open(path).convert("L"), np.float32) / 255.0
+
+    @staticmethod
+    def _load_rgb(path):
+        return np.array(Image.open(path).convert("RGB"), np.float32) / 255.0
+
+    def _random_crop(self, lr, hr, vis):
+        lps = self.ps // self.scale
+        lh, lw = lr.shape[:2]
+        lps = min(lps, lh, lw)
+        hps = lps * self.scale
+        ly = random.randint(0, max(lh - lps, 0))
+        lx = random.randint(0, max(lw - lps, 0))
+        hy, hx = ly * self.scale, lx * self.scale
+        return (lr[ly:ly+lps, lx:lx+lps],
+                hr[hy:hy+hps, hx:hx+hps],
+                vis[hy:hy+hps, hx:hx+hps])
+
+    @staticmethod
+    def _augment(lr, hr, vis):
+        if random.random() > 0.5:
+            lr  = np.ascontiguousarray(np.fliplr(lr))
+            hr  = np.ascontiguousarray(np.fliplr(hr))
+            vis = np.ascontiguousarray(np.fliplr(vis))
+        if random.random() > 0.5:
+            lr  = np.ascontiguousarray(np.flipud(lr))
+            hr  = np.ascontiguousarray(np.flipud(hr))
+            vis = np.ascontiguousarray(np.flipud(vis))
+        k = random.choice([0, 1, 2, 3])
+        if k:
+            lr  = np.ascontiguousarray(np.rot90(lr, k))
+            hr  = np.ascontiguousarray(np.rot90(hr, k))
+            vis = np.ascontiguousarray(np.rot90(vis, k))
+        return lr, hr, vis
+
+    def __len__(self):
+        return len(self.triplets)
+
+    def __getitem__(self, idx):
+        lr_p, hr_p, vis_p, img_id = self.triplets[idx]
+        lr  = self._load_gray(lr_p)
+        hr  = self._load_gray(hr_p)
+        vis = self._load_rgb(vis_p)
+
+        exp_h, exp_w = lr.shape[0] * self.scale, lr.shape[1] * self.scale
+        if hr.shape[0] != exp_h or hr.shape[1] != exp_w:
+            hr = np.array(Image.fromarray((hr * 255).astype(np.uint8)).resize(
+                (exp_w, exp_h), Image.BICUBIC), np.float32) / 255.0
+        if vis.shape[0] != exp_h or vis.shape[1] != exp_w:
+            vis = np.array(Image.fromarray((vis * 255).astype(np.uint8)).resize(
+                (exp_w, exp_h), Image.BICUBIC), np.float32) / 255.0
+
+        if self.split == "train":
+            lr, hr, vis = self._random_crop(lr, hr, vis)
+        if self.aug:
+            lr, hr, vis = self._augment(lr, hr, vis)
+
+        lr_t  = torch.from_numpy(lr).unsqueeze(0)
+        hr_t  = torch.from_numpy(hr).unsqueeze(0)
+        vis_t = torch.from_numpy(vis.transpose(2, 0, 1))
+        return lr_t, hr_t, vis_t, img_id
+
+
+class ThermalGuidedTestDataset(Dataset):
+    """Test dataset — IDENTICAL to working code."""
+    def __init__(self, root, scale):
+        self.scale = scale
+        lr_dir  = os.path.join(root, "thermal", "test",
+                               f"guided_x{scale}", f"LR_x{scale}")
+        vis_dir = os.path.join(root, "visible", "test", f"guided_x{scale}")
+
+        self.pairs = []
+        for lr_path in sorted(glob.glob(os.path.join(lr_dir, "*.*"))):
+            th_base  = os.path.splitext(os.path.basename(lr_path))[0]
+            vis_base = _thermal_base_to_vis_base(th_base)
+            vis_path = _find_file(vis_dir, vis_base)
+            if vis_path:
+                vis_filename = os.path.basename(vis_path)
+                self.pairs.append((lr_path, vis_path, th_base, vis_filename))
+
+        print(f"  [test ] Loaded {len(self.pairs)} pairs  (scale ×{scale})")
+
+    @staticmethod
+    def _load_gray(path):
+        return np.array(Image.open(path).convert("L"), np.float32) / 255.0
+
+    @staticmethod
+    def _load_rgb(path):
+        return np.array(Image.open(path).convert("RGB"), np.float32) / 255.0
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        lr_p, vis_p, th_base, vis_filename = self.pairs[idx]
+        lr  = self._load_gray(lr_p)
+        vis = self._load_rgb(vis_p)
+
+        exp_h, exp_w = lr.shape[0] * self.scale, lr.shape[1] * self.scale
+        if vis.shape[0] != exp_h or vis.shape[1] != exp_w:
+            vis = np.array(Image.fromarray((vis * 255).astype(np.uint8)).resize(
+                (exp_w, exp_h), Image.BICUBIC), np.float32) / 255.0
+
+        lr_t  = torch.from_numpy(lr).unsqueeze(0)
+        vis_t = torch.from_numpy(vis.transpose(2, 0, 1))
+        return lr_t, vis_t, th_base, vis_filename
+
+
+###############################################################################
+#                  10.  SELF-ENSEMBLE (from working code)                     #
+###############################################################################
+
+@torch.no_grad()
+def self_ensemble(model, lr, vis):
+    """8× TTA — IDENTICAL to working code."""
+    preds = []
+    for hflip in (False, True):
+        for rot_k in (0, 1, 2, 3):
+            a_lr, a_vis = lr.clone(), vis.clone()
+            if hflip:
+                a_lr  = torch.flip(a_lr,  [-1])
+                a_vis = torch.flip(a_vis, [-1])
+            if rot_k:
+                a_lr  = torch.rot90(a_lr,  rot_k, [-2, -1])
+                a_vis = torch.rot90(a_vis, rot_k, [-2, -1])
+            pred = model(a_lr, a_vis, training=False)
+            if rot_k:
+                pred = torch.rot90(pred, -rot_k, [-2, -1])
+            if hflip:
+                pred = torch.flip(pred, [-1])
+            preds.append(pred)
+    return torch.stack(preds).mean(0)
+
+
+###############################################################################
+#                      11.  VALIDATION (from working code)                    #
+###############################################################################
+
+@torch.no_grad()
+def validate(model, loader, device, use_ensemble=False):
+    model.eval()
+    psnrs, ssims = [], []
+    for batch in loader:
+        lr, hr, vis = batch[0], batch[1], batch[2]
+        lr, hr, vis = lr.to(device), hr.to(device), vis.to(device)
+        pred = self_ensemble(model, lr, vis) if use_ensemble else \
+               model(lr, vis, training=False)
+        pred = pred.clamp(0, 1)
+        if pred.shape[2:] != hr.shape[2:]:
+            pred = F.interpolate(pred, hr.shape[2:],
+                                 mode="bilinear", align_corners=False)
+        for i in range(pred.size(0)):
+            p = pred[i, 0].cpu().numpy()
+            h = hr[i, 0].cpu().numpy()
+            psnrs.append(calc_psnr(h, p, data_range=1.0))
+            ssims.append(calc_ssim(h, p, data_range=1.0))
+    return float(np.mean(psnrs)), float(np.mean(ssims))
+
+
+@torch.no_grad()
+def bicubic_baseline(loader, scale, device):
+    """Compute bicubic-only PSNR/SSIM for reference."""
+    psnrs, ssims = [], []
+    for batch in loader:
+        lr, hr = batch[0].to(device), batch[1].to(device)
+        bic = F.interpolate(lr, scale_factor=scale,
+                            mode="bicubic", align_corners=False)
+        if bic.shape[2:] != hr.shape[2:]:
+            bic = F.interpolate(bic, hr.shape[2:],
+                                mode="bilinear", align_corners=False)
+        bic = bic.clamp(0, 1)
+        for i in range(bic.size(0)):
+            p = bic[i, 0].cpu().numpy()
+            h = hr[i, 0].cpu().numpy()
+            psnrs.append(calc_psnr(h, p, data_range=1.0))
+            ssims.append(calc_ssim(h, p, data_range=1.0))
+    return float(np.mean(psnrs)), float(np.mean(ssims))
+
+
+###############################################################################
+#                   12.  CONFIGS (from working code + VAE params)             #
+###############################################################################
+
+CONFIGS = {
+    8: dict(
+        # Architecture (from working code — proven)
+        nf=64, n_rrdb=12, gc=32, n_rcab_stage=3, n_rcab_final=4,
+        # VAE-specific (NEW)
+        latent_dim=32,
+        # Training (from working code)
+        bs=4, ps=256, lr=3e-4, epochs=500,
+        # Loss weights (from working code + VAE)
+        loss_w=dict(w_char=1.0, w_ssim=0.5, w_perc=0.02, w_edge=0.1),
+        w_kl=0.0001,           # very small KL weight
+        w_vae_recon=0.01,      # small reconstruction weight
+        # VAE training schedule
+        vae_pretrain_epochs=100,
+        vae_pretrain_lr=1e-3,
+        vae_pretrain_beta=0.001,
+        vae_freeze_epochs=100, # freeze VAE for first 100 SR epochs
+        kl_warmup=50,          # anneal KL over 50 epochs after unfreeze
+    ),
+    16: dict(
+        nf=64, n_rrdb=12, gc=32, n_rcab_stage=3, n_rcab_final=6,
+        latent_dim=32,
+        bs=2, ps=192, lr=3e-4, epochs=600,
+        loss_w=dict(w_char=1.0, w_ssim=0.5, w_perc=0.02, w_edge=0.1),
+        w_kl=0.0001,
+        w_vae_recon=0.01,
+        vae_pretrain_epochs=100,
+        vae_pretrain_lr=1e-3,
+        vae_pretrain_beta=0.001,
+        vae_freeze_epochs=100,
+        kl_warmup=50,
+    ),
+}
+
+
+###############################################################################
+#                 13.  PHASE 1 — VAE PRETRAINING (★ NEW)                     #
+###############################################################################
+
+def pretrain_vae(data_root, scale):
+    """
+    Phase 1: Pretrain Cross-Modal VAE on feature reconstruction.
+
+    The VAE learns to:
+    1. Encode thermal features → compact latent
+    2. Encode visible features → same latent space
+    3. Reconstruct thermal features from fused latent
+    4. Align thermal and visible distributions (alignment loss)
+
+    Returns: pretrained VAE and head state dicts.
+    """
+    cfg = CONFIGS[scale]
+    out = get_out_dir()
+    ckpt_dir = os.path.join(out, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    epochs    = cfg["vae_pretrain_epochs"]
+    beta      = cfg["vae_pretrain_beta"]
+    lr_rate   = cfg["vae_pretrain_lr"]
+    nf        = cfg["nf"]
+    latent_dim = cfg["latent_dim"]
+
+    print(f"\n{'='*70}")
+    print(f"  PHASE 1: VAE PRETRAINING  (scale ×{scale})")
+    print(f"  β={beta}  latent_dim={latent_dim}  epochs={epochs}")
+    print(f"{'='*70}")
+
+    # Dataset (smaller patches for faster VAE pretraining)
+    vae_ps = min(cfg["ps"], 128)
+    train_ds = ThermalGuidedDataset(data_root, scale, "train", vae_ps, augment=True)
+    train_dl = DataLoader(train_ds, batch_size=8, shuffle=True,
+                          num_workers=4, pin_memory=True, drop_last=True)
+
+    # Feature extractors
+    head = nn.Sequential(
+        nn.Conv2d(1, nf, 3, 1, 1), nn.LeakyReLU(0.2, True),
+        nn.Conv2d(nf, nf, 3, 1, 1)).to(DEVICE)
+
+    guide_enc = GuideEncoder(nf).to(DEVICE)
+    guide_enc.eval()
+    for p in guide_enc.parameters():
+        p.requires_grad = False
+
+    # VAE
+    vae = CrossModalVAE(nf, latent_dim).to(DEVICE)
+
+    n_vae   = sum(p.numel() for p in vae.parameters())
+    n_head  = sum(p.numel() for p in head.parameters())
+    print(f"  VAE params: {n_vae:,}  |  Head params: {n_head:,}\n")
+
+    optimizer = optim.AdamW(
+        list(vae.parameters()) + list(head.parameters()),
+        lr=lr_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, eta_min=1e-6)
+
+    pre_key = "s16" if scale >= 16 else ("s8" if scale >= 8 else "s4")
+    best_loss = float("inf")
+
+    for epoch in range(1, epochs + 1):
+        vae.train()
+        head.train()
+        ep_loss = ep_recon = ep_kl = 0.0
+
+        for lr_t, _, vis, _ in train_dl:
+            lr_t, vis = lr_t.to(DEVICE), vis.to(DEVICE)
+
+            th_feat = head(lr_t)
+            with torch.no_grad():
+                gf = guide_enc(vis)
+            g_lr = F.interpolate(gf[pre_key], size=th_feat.shape[2:],
+                                 mode="bilinear", align_corners=False)
+
+            latent_feat, kl_loss, recon_loss = vae(th_feat, g_lr, training=True)
+
+            beta_eff = beta * min(1.0, epoch / (0.2 * epochs))
+            loss = recon_loss + beta_eff * kl_loss
+
+            if math.isnan(loss.item()):
+                continue
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(vae.parameters()) + list(head.parameters()), 1.0)
+            optimizer.step()
+
+            ep_loss  += loss.item()
+            ep_recon += recon_loss.item()
+            ep_kl    += kl_loss.item()
+
+        scheduler.step()
+        n_batches = max(len(train_dl), 1)
+
+        if epoch % 10 == 0 or epoch <= 3 or epoch == epochs:
+            print(f"  VAE Ep {epoch:3d}/{epochs}  "
+                  f"loss={ep_loss/n_batches:.5f}  "
+                  f"recon={ep_recon/n_batches:.5f}  "
+                  f"kl={ep_kl/n_batches:.3f}  "
+                  f"β_eff={beta_eff:.5f}")
+
+        if ep_loss / n_batches < best_loss:
+            best_loss = ep_loss / n_batches
+            torch.save({"vae": vae.state_dict(), "head": head.state_dict(),
+                        "epoch": epoch, "loss": best_loss},
+                       os.path.join(ckpt_dir, f"vae_pretrained_x{scale}.pth"))
+
+    print(f"\n  ✓ VAE pretrained  best_loss={best_loss:.5f}")
+    print(f"  ✓ Saved → {ckpt_dir}/vae_pretrained_x{scale}.pth\n")
+
+    return vae.state_dict(), head.state_dict()
+
+
+###############################################################################
+#          14.  PHASE 2+3 — FULL SR TRAINING (★ modified working code)        #
+###############################################################################
+
+def train_model(scale, data_root, vae_state=None, head_state=None):
+    """
+    Phase 2: Train SR with frozen pretrained VAE (epochs 1 → vae_freeze_epochs)
+    Phase 3: End-to-end fine-tuning with unfrozen VAE (remaining epochs)
+    """
+    cfg = CONFIGS[scale]
+    out = get_out_dir()
+    ckpt_dir = os.path.join(out, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    print(f"\n{'#'*70}")
+    print(f"#  PHASE 2+3: SR TRAINING  ×{scale}")
+    print(f"#  {cfg['n_rrdb']} VAE-GuidedRRDB  |  {cfg['epochs']} epochs")
+    print(f"#  VAE frozen: first {cfg['vae_freeze_epochs']} epochs")
+    print(f"{'#'*70}")
+
+    # ── Data ──
+    train_ds = ThermalGuidedDataset(data_root, scale, "train", cfg["ps"], augment=True)
+    val_ds   = ThermalGuidedDataset(data_root, scale, "val",   cfg["ps"], augment=False)
+    train_dl = DataLoader(train_ds, cfg["bs"], shuffle=True,
+                          num_workers=4, pin_memory=True, drop_last=True)
+    val_dl   = DataLoader(val_ds, batch_size=1, shuffle=False,
+                          num_workers=2, pin_memory=True)
+
+    # ── Bicubic baseline ──
+    bic_psnr, bic_ssim = bicubic_baseline(val_dl, scale, DEVICE)
+    print(f"\n  Bicubic baseline:  PSNR={bic_psnr:.2f} dB  SSIM={bic_ssim:.4f}")
+
+    # ── Model ──
+    model = VAEGuidedThermalSRNet(
+        scale, cfg["nf"], cfg["n_rrdb"], cfg["gc"],
+        cfg["n_rcab_stage"], cfg["n_rcab_final"],
+        latent_dim=cfg["latent_dim"]
+    ).to(DEVICE)
+
+    # Load pretrained components
+    if vae_state is not None:
+        model.vae.load_state_dict(vae_state)
+        print("  ✓ Loaded pretrained VAE weights")
+    if head_state is not None:
+        model.head.load_state_dict(head_state)
+        print("  ✓ Loaded pretrained head weights")
+
+    n_total = sum(p.numel() for p in model.parameters())
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Parameters: {n_total:,} total  |  {n_train:,} trainable  |  "
+          f"{n_total*4/1024**2:.1f} MB\n")
+
+    # ── Loss ──
+    criterion = CombinedSRLoss(
+        **cfg["loss_w"],
+        w_kl=cfg["w_kl"],
+        w_vae_recon=cfg["w_vae_recon"]
+    ).to(DEVICE)
+
+    # ── Optimizer (differential LR — from working code) ──
+    guide_ids = set(id(p) for p in model.guide_enc.parameters())
+    vae_ids   = set(id(p) for p in model.vae.parameters())
+
+    main_params  = [p for p in model.parameters()
+                    if id(p) not in guide_ids and id(p) not in vae_ids
+                    and p.requires_grad]
+    guide_params = [p for p in model.guide_enc.parameters() if p.requires_grad]
+    vae_params   = [p for p in model.vae.parameters() if p.requires_grad]
+
+    optimizer = optim.AdamW([
+        {"params": main_params,  "lr": cfg["lr"]},
+        {"params": guide_params, "lr": cfg["lr"] * 0.1},
+        {"params": vae_params,   "lr": cfg["lr"] * 0.1},
+    ], weight_decay=1e-4)
+
+    # ── Scheduler (from working code: T_0=100) ──
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=100, T_mult=2, eta_min=1e-6)
+
+    ema = EMA(model, decay=0.999)
+
+    # ── Freeze VAE for Phase 2 ──
+    vae_frozen = True
+    if vae_state is not None:
+        for p in model.vae.parameters():
+            p.requires_grad = False
+        print(f"  ❄ VAE frozen for first {cfg['vae_freeze_epochs']} epochs\n")
+
+    best_ckpt = os.path.join(ckpt_dir, f"best_x{scale}.pth")
+    best_psnr, best_ssim = 0.0, 0.0
+    history = {"epoch": [], "loss": [], "psnr": [], "ssim": []}
+
+    for epoch in range(1, cfg["epochs"] + 1):
+        # ── Phase transition: unfreeze VAE ──
+        if vae_frozen and epoch > cfg["vae_freeze_epochs"]:
+            for p in model.vae.parameters():
+                p.requires_grad = True
+            vae_frozen = False
+            ema = EMA(model, decay=0.999)
+            print(f"\n  🔥 Phase 3: VAE unfrozen at epoch {epoch} "
+                  f"→ end-to-end fine-tuning\n")
+
+        model.train()
+        ep_loss = 0.0
+
+        for batch in train_dl:
+            lr, hr, vis = batch[0], batch[1], batch[2]
+            lr, hr, vis = lr.to(DEVICE), hr.to(DEVICE), vis.to(DEVICE)
+
+            pred, kl_loss, vae_recon_loss = model(lr, vis, training=True)
+
+            if pred.shape[2:] != hr.shape[2:]:
+                pred = F.interpolate(pred, hr.shape[2:],
+                                     mode="bilinear", align_corners=False)
+
+            # KL warmup starts AFTER VAE is unfrozen
+            effective_epoch = max(0, epoch - cfg["vae_freeze_epochs"])
+            loss = criterion(pred, hr, kl_loss, vae_recon_loss,
+                             effective_epoch, cfg["epochs"],
+                             cfg["kl_warmup"])
+
+            if math.isnan(loss.item()):
+                print("⚠ NaN loss – skipping batch")
+                continue
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step()
+            ema.update(model)
+            ep_loss += loss.item()
+
+        scheduler.step()
+        avg_loss = ep_loss / max(len(train_dl), 1)
+
+        # ── Validate ──
+        psnr_val = ssim_val = None
+        if epoch % 5 == 0 or epoch <= 3:
+            ema.apply(model)
+            psnr_val, ssim_val = validate(model, val_dl, DEVICE, use_ensemble=False)
+            ema.restore(model)
+
+            improved = ""
+            if psnr_val > best_psnr:
+                best_psnr = psnr_val
+                best_ssim = ssim_val
+                ema.apply(model)
+                torch.save(model.state_dict(), best_ckpt)
+                ema.restore(model)
+                improved = " ★"
+
+            cur_lr = optimizer.param_groups[0]["lr"]
+            vae_tag = "❄" if vae_frozen else "🔥"
+            improvement = psnr_val - bic_psnr
+            print(f"  Ep {epoch:4d}/{cfg['epochs']}  loss={avg_loss:.5f}  "
+                  f"PSNR={psnr_val:.2f} (+{improvement:.1f})  "
+                  f"SSIM={ssim_val:.4f}  best={best_psnr:.2f}/{best_ssim:.4f}  "
+                  f"lr={cur_lr:.1e}  VAE={vae_tag}{improved}")
+
+        history["epoch"].append(epoch)
+        history["loss"].append(avg_loss)
+        history["psnr"].append(psnr_val)
+        history["ssim"].append(ssim_val)
+
+    # ── Final self-ensemble evaluation ──
+    print(f"\n  Final 8× self-ensemble evaluation …")
+    model.load_state_dict(torch.load(best_ckpt))
+    model.to(DEVICE)
+    final_psnr, final_ssim = validate(model, val_dl, DEVICE, use_ensemble=True)
+
+    print(f"\n{'='*70}")
+    print(f"  RESULTS  ×{scale}")
+    print(f"{'='*70}")
+    print(f"  Bicubic baseline:    PSNR={bic_psnr:.2f}  SSIM={bic_ssim:.4f}")
+    print(f"  Best single-pass:    PSNR={best_psnr:.2f}  SSIM={best_ssim:.4f}")
+    print(f"  8× self-ensemble:    SE-PSNR={final_psnr:.2f}  SE-SSIM={final_ssim:.4f}")
+    print(f"  Improvement over bic: +{max(best_psnr,final_psnr)-bic_psnr:.2f} dB")
+    print(f"{'='*70}\n")
+
+    if final_psnr > best_psnr:
+        best_psnr = final_psnr
+        best_ssim = final_ssim
+
+    return model, history, best_psnr, best_ssim
+
+
+###############################################################################
+#                15.  TEST INFERENCE + SUBMISSION ZIP                         #
+###############################################################################
+
+@torch.no_grad()
+def run_test_and_create_submission(data_root):
+    out = get_out_dir()
+    submission_dir = os.path.join(out, "submission")
+    all_metrics = {}
+
+    for scale in [8, 16]:
+        cfg = CONFIGS[scale]
+        ckpt_path = os.path.join(out, "checkpoints", f"best_x{scale}.pth")
+
+        if not os.path.isfile(ckpt_path):
+            print(f"\n  ✗ Checkpoint not found: {ckpt_path}")
+            continue
+
+        model = VAEGuidedThermalSRNet(
+            scale, cfg["nf"], cfg["n_rrdb"], cfg["gc"],
+            cfg["n_rcab_stage"], cfg["n_rcab_final"],
+            latent_dim=cfg["latent_dim"]
+        ).to(DEVICE)
+        model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+        model.eval()
+
+        sub_dir = os.path.join(submission_dir, f"x{scale}")
+        os.makedirs(sub_dir, exist_ok=True)
+        for f in glob.glob(os.path.join(sub_dir, "*")):
+            os.remove(f)
+
+        test_ds = ThermalGuidedTestDataset(data_root, scale)
+        test_dl = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=2)
+
+        print(f"\n  ×{scale} test — {len(test_ds)} images")
+        for idx, (lr, vis, th_base, vis_filename) in enumerate(test_dl):
+            lr, vis = lr.to(DEVICE), vis.to(DEVICE)
+            pred = self_ensemble(model, lr, vis).clamp(0, 1)
+            sr_uint8 = (pred[0, 0].cpu().numpy() * 255).astype(np.uint8)
+            out_name = os.path.splitext(vis_filename[0])[0] + ".bmp"
+            Image.fromarray(sr_uint8, mode="L").save(
+                os.path.join(sub_dir, out_name), format="BMP")
+            if (idx + 1) % 20 == 0 or idx == 0:
+                print(f"    {idx+1:3d}/{len(test_ds)}  {th_base[0]} → {out_name}")
+
+        print(f"  ✓ Saved {len(test_ds)} SR images → {sub_dir}/")
+
+        # Validation metrics
+        val_ds = ThermalGuidedDataset(data_root, scale, "val", cfg["ps"], augment=False)
+        val_dl = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2)
+        psnr_v, ssim_v = validate(model, val_dl, DEVICE, use_ensemble=True)
+        all_metrics[scale] = {"psnr": psnr_v, "ssim": ssim_v}
+        print(f"  Val  SE-PSNR={psnr_v:.2f}  SE-SSIM={ssim_v:.4f}")
+
+    # Create zip
+    zip_path = os.path.join(out, "submission.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for folder in ["x8", "x16"]:
+            fp = os.path.join(submission_dir, folder)
+            if os.path.isdir(fp):
+                for fname in sorted(os.listdir(fp)):
+                    zf.write(os.path.join(fp, fname), os.path.join(folder, fname))
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        contents = zf.namelist()
+
+    print(f"\n{'='*70}")
+    print(f"  ✅  SUBMISSION ZIP")
+    print(f"{'='*70}")
+    print(f"  Path:  {zip_path}")
+    print(f"  Size:  {os.path.getsize(zip_path)/1024:.1f} KB  |  {len(contents)} files")
+    for s in [8, 16]:
+        if s in all_metrics:
+            m = all_metrics[s]
+            print(f"  ×{s}:  SE-PSNR={m['psnr']:.2f}  SE-SSIM={m['ssim']:.4f}")
+    print(f"{'='*70}")
+
+    return zip_path, all_metrics
+
+
+###############################################################################
+#                        16.  DISPLAY SUMMARY                                 #
+###############################################################################
+
+def display_results(h8, h16, p8, s8, p16, s16):
+    out = get_out_dir()
+
+    print(f"\n{'='*70}")
+    print("                  FINAL RESULTS SUMMARY")
+    print(f"{'='*70}")
+    print(f"  ×8   SE-PSNR = {p8:.2f} dB    SE-SSIM = {s8:.4f}")
+    print(f"  ×16  SE-PSNR = {p16:.2f} dB    SE-SSIM = {s16:.4f}")
+    print(f"{'='*70}")
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    for hist, label in [(h8, "×8"), (h16, "×16")]:
+        axes[0].plot(hist["epoch"], hist["loss"], label=label, alpha=0.7)
+        eps = [e for e, v in zip(hist["epoch"], hist["psnr"]) if v is not None]
+        pvs = [v for v in hist["psnr"] if v is not None]
+        svs = [v for v in hist["ssim"] if v is not None]
+        axes[1].plot(eps, pvs, "o-", label=label, markersize=2)
+        axes[2].plot(eps, svs, "o-", label=label, markersize=2)
+
+    axes[0].set(xlabel="Epoch", ylabel="Loss",      title="Training Loss")
+    axes[1].set(xlabel="Epoch", ylabel="PSNR (dB)",  title="Val PSNR")
+    axes[2].set(xlabel="Epoch", ylabel="SSIM",       title="Val SSIM")
+    for ax in axes:
+        ax.legend(); ax.grid(True, alpha=.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out, "training_curves.png"), dpi=150)
+    plt.close()
+    print(f"  📊 Saved {os.path.join(out, 'training_curves.png')}")
+
+    summary = {
+        "model": "VAEGuidedThermalSRNet",
+        "x8":  {"SE-PSNR": round(p8, 2),  "SE-SSIM": round(s8, 4)},
+        "x16": {"SE-PSNR": round(p16, 2), "SE-SSIM": round(s16, 4)},
+        "architecture": {
+            "base": "GuidedThermalSRNet (proven working code)",
+            "enhancement": "Pretrained Cross-Modal VAE",
+            "phases": ["1: VAE pretrain", "2: SR train (frozen VAE)",
+                       "3: End-to-end fine-tune"],
+        },
+    }
+    with open(os.path.join(out, "final_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  📄 Saved {os.path.join(out, 'final_summary.json')}")
+
+
+###############################################################################
+#                             17.  MAIN                                       #
+###############################################################################
+
+if __name__ == "__main__":
+    DATA_ROOT = "/home/rsnfh/Downloads/CIDIS Dataset"
+
+    if not os.path.isdir(DATA_ROOT):
+        print(f"ERROR: dataset not found at {DATA_ROOT}")
+        sys.exit(1)
+
+    set_out_dir(DATA_ROOT)
+
+    # ──────── Verify dataset ────────
+    print("\n" + "="*70)
+    print("  DATASET VERIFICATION")
+    print("="*70)
+    expected = {
+        "thermal/train/GT":               "HR thermal GT (train)",
+        "thermal/train/LR_x8":            "LR thermal ×8 (train)",
+        "thermal/train/LR_x16":           "LR thermal ×16 (train)",
+        "thermal/val/GT":                 "HR thermal GT (val)",
+        "thermal/val/LR_x8":              "LR thermal ×8 (val)",
+        "thermal/val/LR_x16":             "LR thermal ×16 (val)",
+        "visible/train":                  "HR visible (train)",
+        "visible/val":                    "HR visible (val)",
+        "thermal/test/guided_x8/LR_x8":   "LR thermal ×8 (test)",
+        "thermal/test/guided_x16/LR_x16": "LR thermal ×16 (test)",
+        "visible/test/guided_x8":         "HR visible ×8 (test)",
+        "visible/test/guided_x16":        "HR visible ×16 (test)",
+    }
+    for subdir, desc in expected.items():
+        full = os.path.join(DATA_ROOT, subdir)
+        exists = os.path.isdir(full)
+        n = len(glob.glob(os.path.join(full, "*.*"))) if exists else 0
+        print(f"  {'✓' if exists else '✗'} {n:4d} files  {subdir:<45s}  ({desc})")
+
+    # ──────── Config summary ────────
+    print("\n" + "="*70)
+    print("  CONFIGURATION (working code base + VAE enhancement)")
+    print("="*70)
+    for scale in [8, 16]:
+        cfg = CONFIGS[scale]
+        print(f"\n  ×{scale}:")
+        print(f"    Trunk:     {cfg['n_rrdb']} VAE-GuidedRRDB blocks")
+        print(f"    Patch:     {cfg['ps']}×{cfg['ps']} (HR)")
+        print(f"    Batch:     {cfg['bs']}")
+        print(f"    LR:        {cfg['lr']}")
+        print(f"    Epochs:    {cfg['epochs']}  (VAE pretrain: {cfg['vae_pretrain_epochs']})")
+        print(f"    Losses:    char={cfg['loss_w']['w_char']}, "
+              f"ssim={cfg['loss_w']['w_ssim']}, "
+              f"perc={cfg['loss_w']['w_perc']}, "
+              f"edge={cfg['loss_w']['w_edge']}, "
+              f"kl={cfg['w_kl']}, vae_recon={cfg['w_vae_recon']}")
+        print(f"    VAE:       latent_dim={cfg['latent_dim']}, "
+              f"β={cfg['vae_pretrain_beta']}, "
+              f"freeze={cfg['vae_freeze_epochs']} epochs")
+
+    # ════════════════════════════════════════════════════════════════
+    #                        TRAIN ×8
+    # ════════════════════════════════════════════════════════════════
+    print("\n\n" + "█"*70)
+    print("█" + " "*24 + "SCALE ×8" + " "*36 + "█")
+    print("█"*70 + "\n")
+
+    # Phase 1: Pretrain VAE
+    vae_state_x8, head_state_x8 = pretrain_vae(DATA_ROOT, scale=8)
+
+    # Phase 2+3: SR training
+    model_x8, hist_x8, psnr_x8, ssim_x8 = train_model(
+        scale=8, data_root=DATA_ROOT,
+        vae_state=vae_state_x8, head_state=head_state_x8)
+
+    # ════════════════════════════════════════════════════════════════
+    #                        TRAIN ×16
+    # ════════════════════════════════════════════════════════════════
+    print("\n\n" + "█"*70)
+    print("█" + " "*24 + "SCALE ×16" + " "*35 + "█")
+    print("█"*70 + "\n")
+
+    # Phase 1: Pretrain VAE
+    vae_state_x16, head_state_x16 = pretrain_vae(DATA_ROOT, scale=16)
+
+    # Phase 2+3: SR training
+    model_x16, hist_x16, psnr_x16, ssim_x16 = train_model(
+        scale=16, data_root=DATA_ROOT,
+        vae_state=vae_state_x16, head_state=head_state_x16)
+
+    # ════════════════════════════════════════════════════════════════
+    #                     RESULTS + SUBMISSION
+    # ════════════════════════════════════════════════════════════════
+    display_results(hist_x8, hist_x16, psnr_x8, ssim_x8, psnr_x16, ssim_x16)
+
+    print("\n" + "#"*70)
+    print("#  TEST INFERENCE + SUBMISSION ZIP")
+    print("#"*70)
+    zip_path, metrics = run_test_and_create_submission(DATA_ROOT)
+
+    print(f"\n{'='*70}")
+    print(f"  ✅  ALL DONE  (VAE-Enhanced GuidedThermalSRNet)")
+    print(f"{'='*70}")
+    print(f"  All outputs   → {get_out_dir()}")
+    print(f"  Submission    → {zip_path}")
+    print(f"{'='*70}")
